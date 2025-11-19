@@ -22,7 +22,9 @@ var AOI_LIST = [
 
 // AOI dictionary
 var AOI_DICT = {};
-AOI_LIST.forEach(function(aoi) { AOI_DICT[aoi.key] = aoi.fc; });
+for (var i = 0; i < AOI_LIST.length; i++) {
+  AOI_DICT[AOI_LIST[i].key] = AOI_LIST[i].fc;
+}
 
 // AOI colors
 var AOI_COLORS = {
@@ -41,6 +43,7 @@ var bandOptions = [
 // -----------------------
 // Sentinel-2 collection and pre-processing
 // -----------------------
+
 var S2raw = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
   .filterBounds(natRe)
   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40));
@@ -58,6 +61,7 @@ var S2 = S2raw.map(maskAndScale);
 // -----------------------
 // Indices Computation
 // -----------------------
+
 function computeAllIndices(image) {
   var S2_NDVI = image.normalizedDifference(['B8','B4']).rename('S2_NDVI');
   var S2_EVI = image.expression(
@@ -75,30 +79,34 @@ function computeAllIndices(image) {
     {NIR: image.select('B8'), RE: image.select('B5'), RED: image.select('B4')}
   ).rename('S2_CCCI');
 
-  return ee.Image([image.select(['B2','B3','B4']), S2_NDVI, S2_EVI, S2_SAVI, S2_NBR, S2_GNDVI, S2_CCCI])
+  return ee.Image([S2_NDVI, S2_EVI, S2_SAVI, S2_NBR, S2_GNDVI, S2_CCCI])
            .copyProperties(image, ['system:time_start']);
 }
-
-// Precompute indices for all S2 images
-var S2all = S2.map(computeAllIndices);
 
 // -----------------------
 // Interval Generation
 // -----------------------
+
 function getIntervals(intervalType, startYear, endYear) {
   var intervals = [];
   for (var y = startYear; y <= endYear; y++) {
     var yearStart = ee.Date.fromYMD(y, 1, 1);
     if (intervalType === 'Biweekly') {
       for (var w = 0; w < 52; w++) {
-        intervals.push({start: yearStart.advance(14 * w, 'day'), end: yearStart.advance(14 * (w + 1), 'day')});
+        intervals.push({
+          start: yearStart.advance(14 * w, 'day'),
+          end: yearStart.advance(14 * (w + 1), 'day')
+        });
       }
     } else if (intervalType === 'Seasonal') {
       var seasons = [[1,3],[4,6],[7,9],[10,12]];
       for (var s = 0; s < seasons.length; s++) {
-        intervals.push({start: ee.Date.fromYMD(y, seasons[s][0], 1), end: ee.Date.fromYMD(y, seasons[s][1], 1).advance(1, 'month')});
+        intervals.push({
+          start: ee.Date.fromYMD(y, seasons[s][0], 1),
+          end: ee.Date.fromYMD(y, seasons[s][1], 1).advance(1, 'month')
+        });
       }
-    } else {
+    } else { 
       intervals.push({start: ee.Date.fromYMD(y,1,1), end: ee.Date.fromYMD(y+1,1,1)});
     }
   }
@@ -106,22 +114,26 @@ function getIntervals(intervalType, startYear, endYear) {
 }
 
 // -----------------------
-// UI Elements
+// UI 
 // -----------------------
+
 var bandSelect = ui.Select({items: bandOptions, value: 'S2_NDVI', style: {width: '220px'}});
 var intervalSelect = ui.Select({items: ['Biweekly','Seasonal','Yearly'], value: 'Biweekly', style: {width: '220px'}});
 var graphTypeSelect = ui.Select({items: ['Median','Delta (Previous Interval)','Delta (Between AOIs)'], value: 'Median', style: {width: '220px'}});
 
-var deltaItems = AOI_LIST.filter(function(aoi){ return aoi.key!=='OSS_Dump'; }).map(function(aoi){ return aoi.label; });
-var deltaCompareSelect = ui.Select({items: deltaItems, value: deltaItems[0], style: {width: '220px'}});
+var deltaItems = [];
+for (var di = 0; di < AOI_LIST.length; di++) {
+  if (AOI_LIST[di].key !== 'OSS_Dump') deltaItems.push(AOI_LIST[di].label);
+}
+var deltaCompareSelect = ui.Select({items: deltaItems, value: AOI_LIST[1].label, style: {width: '220px'}});
 
 var aoiCheckboxes = {};
 var aoiCheckboxPanel = ui.Panel({layout: ui.Panel.Layout.flow('vertical')});
-AOI_LIST.forEach(function(aoi){
-  var cb = ui.Checkbox(aoi.label, true);
-  aoiCheckboxes[aoi.key] = cb;
+for (var i = 0; i < AOI_LIST.length; i++) {
+  var cb = ui.Checkbox(AOI_LIST[i].label, true);
+  aoiCheckboxes[AOI_LIST[i].key] = cb;
   aoiCheckboxPanel.add(cb);
-});
+}
 
 var runButton = ui.Button({label: 'Run', onClick: runChartsEE});
 var exportButton = ui.Button({label: 'Export CSV', onClick: exportCSV});
@@ -142,36 +154,41 @@ ui.root.widgets().reset([leftPanel]);
 // -----------------------
 // AOI grabber
 // -----------------------
+
 function getSelectedAOIKeys() {
-  var keys = Object.keys(aoiCheckboxes).filter(function(k){ return aoiCheckboxes[k].getValue(); });
+  var keys = [];
+  for (var k in aoiCheckboxes) { if(aoiCheckboxes[k].getValue()) keys.push(k); }
   if(keys.indexOf('OSS_Dump')===-1) keys.unshift('OSS_Dump');
-  else keys = ['OSS_Dump'].concat(keys.filter(function(k){ return k!=='OSS_Dump'; }));
+  else {
+    var tmpKeys = ['OSS_Dump'];
+    for (var j = 0; j < keys.length; j++) { if (keys[j]!=='OSS_Dump') tmpKeys.push(keys[j]); }
+    keys = tmpKeys;
+  }
   return keys;
 }
 
 // -----------------------
-// Compute medians safely
+// Compute medians
 // -----------------------
-function computeMedians(selectedBand, intervalType, selectedKeys) {
-  var intervals = getIntervals(intervalType,2018,2024);
 
+function computeMedians(selectedBand, intervalType, selectedKeys) {
+  var S2i = (['B2','B3','B4'].indexOf(selectedBand) > -1) ? S2 : S2.map(computeAllIndices);
+  var intervals = getIntervals(intervalType,2018,2024);
   return ee.FeatureCollection(intervals.map(function(interval){
     interval = ee.Dictionary(interval);
     var start = ee.Date(interval.get('start'));
     var end = ee.Date(interval.get('end'));
-    var filtered = S2all.filterDate(start,end);
+    var filtered = S2i.filterDate(start,end);
     var med = filtered.median();
     var props = {intervalStart: start.format('YYYY-MM-dd'), intervalEnd: end.format('YYYY-MM-dd')};
-
-    selectedKeys.forEach(function(k){
+    for(var iKey=0;iKey<selectedKeys.length;iKey++){
+      var k = selectedKeys[iKey];
       var geom = ee.FeatureCollection(AOI_DICT[k]).geometry();
-      var valDict = med.reduceRegion({reducer: ee.Reducer.median(), geometry: geom, scale:10, maxPixels:1e10});
-      var pxDict = med.reduceRegion({reducer: ee.Reducer.count(), geometry: geom, scale:10, maxPixels:1e10});
-
-      props[k] = valDict.contains(selectedBand) ? ee.Number(valDict.get(selectedBand)) : null;
-      props['px_'+k] = pxDict.contains(selectedBand) ? ee.Number(pxDict.get(selectedBand)) : null;
-    });
-
+      var val = med.reduceRegion({reducer:ee.Reducer.median(), geometry:geom, scale:10, maxPixels:1e10}).get(selectedBand);
+      var px = med.reduceRegion({reducer:ee.Reducer.count(), geometry:geom, scale:10, maxPixels:1e10}).get(selectedBand);
+      props[k] = val ? ee.Number(val) : null;
+      props['px_'+k] = px ? ee.Number(px) : null;
+    }
     return ee.Feature(null, props);
   }));
 }
@@ -179,6 +196,7 @@ function computeMedians(selectedBand, intervalType, selectedKeys) {
 // -----------------------
 // Charts
 // -----------------------
+
 function runChartsEE() {
   var selectedBand = bandSelect.getValue();
   var intervalType = intervalSelect.getValue();
@@ -187,6 +205,7 @@ function runChartsEE() {
   var compareLabel = deltaCompareSelect.getValue();
 
   var fc = computeMedians(selectedBand, intervalType, selectedKeys);
+  var props = selectedKeys.slice();
 
   if(graphType==='Delta (Previous Interval)'){
     var list = fc.toList(fc.size());
@@ -195,18 +214,26 @@ function runChartsEE() {
       var prev = ee.Feature(list.get(ii-1));
       var curr = ee.Feature(list.get(ii));
       var fprops = {intervalStart: curr.get('intervalStart')};
-      selectedKeys.forEach(function(p){
+      for(var jj=0;jj<props.length;jj++){
+        var p = props[jj];
         var prevVal = prev.get(p);
         var currVal = curr.get(p);
         fprops[p] = (prevVal!==null && currVal!==null) ? ee.Number(currVal).subtract(prevVal) : null;
-      });
+      }
       return ee.Feature(null,fprops);
     });
     fc = ee.FeatureCollection(deltaFeatures);
   }
 
   if(graphType==='Delta (Between AOIs)'){
-    var compareKey = AOI_LIST.find(function(aoi){ return aoi.label===compareLabel; }).key;
+    var compareKey = null;
+    for(var ci=0; ci<AOI_LIST.length; ci++){ if(AOI_LIST[ci].label===compareLabel) compareKey=AOI_LIST[ci].key; }
+    if(selectedKeys.indexOf(compareKey)===-1){
+      var newKeys = ['OSS_Dump',compareKey];
+      for(var nk=0; nk<selectedKeys.length; nk++){ if(selectedKeys[nk]!=='OSS_Dump' && selectedKeys[nk]!==compareKey) newKeys.push(selectedKeys[nk]); }
+      selectedKeys = newKeys;
+      fc = computeMedians(selectedBand, intervalType, selectedKeys);
+    }
     fc = fc.map(function(f){
       var ossVal = f.get('OSS_Dump');
       var cmpVal = f.get(compareKey);
@@ -214,29 +241,26 @@ function runChartsEE() {
       return f.set('Delta', delta);
     });
     var deltaColor = AOI_COLORS[compareKey] || 'black';
-    print(ui.Chart.feature.byFeature(fc,'intervalStart',['Delta'])
-      .setOptions({
-        title:'Delta (OSS - '+compareLabel+') — '+selectedBand,
-        hAxis:{title:'Interval'}, vAxis:{title:'Delta'}, lineWidth:2, pointSize:0,
-        interpolateNulls:true, series:{0:{color:deltaColor}}
-      }));
-    return;
+    var chart = ui.Chart.feature.byFeature(fc,'intervalStart',['Delta']).setOptions({
+      title:'Delta (OSS - '+compareLabel+') — '+selectedBand,
+      hAxis:{title:'Interval'},vAxis:{title:'Delta'},lineWidth:2,pointSize:0,interpolateNulls:true,series:{0:{color:deltaColor}}
+    });
+    print(chart); return;
   }
 
-  // Default Median chart
   var seriesObj = {};
-  selectedKeys.forEach(function(k,i){ seriesObj[i] = {color: AOI_COLORS[k] || 'black'}; });
-  print(ui.Chart.feature.byFeature(fc,'intervalStart',selectedKeys)
-    .setOptions({
-      title: graphType+' '+selectedBand+' per AOI',
-      hAxis:{title:'Interval'}, vAxis:{title:selectedBand},
-      lineWidth:2, pointSize:0, interpolateNulls:true, series:seriesObj
-    }));
+  for(var si=0;si<props.length;si++){ seriesObj[si]={color:AOI_COLORS[props[si]]||'black'}; }
+  var chart = ui.Chart.feature.byFeature(fc,'intervalStart',props).setOptions({
+    title:graphType+' '+selectedBand+' per AOI',
+    hAxis:{title:'Interval'},vAxis:{title:selectedBand},lineWidth:2,pointSize:0,interpolateNulls:true,series:seriesObj
+  });
+  print(chart);
 }
 
 // -----------------------
 // Export CSV
 // -----------------------
+
 function exportCSV() {
   var selectedBand = bandSelect.getValue();
   var intervalType = intervalSelect.getValue();
@@ -245,6 +269,7 @@ function exportCSV() {
   var compareLabel = deltaCompareSelect.getValue();
 
   var fc = computeMedians(selectedBand, intervalType, selectedKeys);
+  var props = selectedKeys.slice();
 
   if(graphType==='Delta (Previous Interval)'){
     var list = fc.toList(fc.size());
@@ -253,30 +278,40 @@ function exportCSV() {
       var prev = ee.Feature(list.get(ii-1));
       var curr = ee.Feature(list.get(ii));
       var fprops = {intervalStart: curr.get('intervalStart')};
-      selectedKeys.forEach(function(p){
+      for(var jj=0;jj<props.length;jj++){
+        var p = props[jj];
         var prevVal = prev.get(p);
         var currVal = curr.get(p);
         fprops[p] = (prevVal!==null && currVal!==null) ? ee.Number(currVal).subtract(prevVal) : null;
         fprops['px_'+p] = curr.get('px_'+p);
-      });
+      }
       return ee.Feature(null,fprops);
     });
     fc = ee.FeatureCollection(deltaList);
   }
 
   if(graphType==='Delta (Between AOIs)'){
-    var compareKey = AOI_LIST.find(function(aoi){ return aoi.label===compareLabel; }).key;
+    var compareKey = null;
+    for(var ci=0; ci<AOI_LIST.length; ci++){ if(AOI_LIST[ci].label===compareLabel) compareKey=AOI_LIST[ci].key; }
+    if(selectedKeys.indexOf(compareKey)===-1){
+      var newKeys = ['OSS_Dump',compareKey];
+      for(var nk=0; nk<selectedKeys.length; nk++){ if(selectedKeys[nk]!=='OSS_Dump' && selectedKeys[nk]!==compareKey) newKeys.push(selectedKeys[nk]); }
+      selectedKeys = newKeys;
+      fc = computeMedians(selectedBand, intervalType, selectedKeys);
+    }
     fc = fc.map(function(f){
       var ossVal = f.get('OSS_Dump');
       var cmpVal = f.get(compareKey);
       var delta = (ossVal!==null && cmpVal!==null) ? ee.Number(ossVal).subtract(cmpVal) : null;
       return f.set('Delta', delta);
     });
+    props = ['intervalStart','Delta'].concat(props);
   }
 
   var typeLabel = graphType==='Median'?'Median':(graphType==='Delta (Previous Interval)'?'DeltaPrev':'DeltaAOI');
   var exportName = intervalType+'_'+typeLabel+'_'+selectedBand;
 
-  Export.table.toDrive({collection:fc, description:exportName, folder:'summarycsvs', fileFormat:'CSV'});
+  Export.table.toDrive({collection:fc,description:exportName,folder:'summarycsvs',fileFormat:'CSV'});
   print('Export started: '+exportName+'.csv');
 }
+

@@ -1,0 +1,219 @@
+
+
+//AOIS
+var dump = ee.FeatureCollection('projects/ossdump-475215/assets/ossdump');
+var control = ee.FeatureCollection('projects/ossdump-475215/assets/splitcreek');
+
+var ccdcGeom = dump.geometry().union(control.geometry());
+Map.centerObject(dump, 14);
+
+//SENTINEL 2 COMPOSITES
+var s2raw = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(ccdcGeom)
+  .filterDate('2018-01-01', '2024-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60));
+
+var years  = ee.List.sequence(2018, 2024);
+var months = ee.List.sequence(1, 12);
+
+var s2monthly = ee.ImageCollection(
+  years.map(function(y) {
+    return months.map(function(m) {
+      var ic = s2raw
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'));
+
+     
+      return ic.median()
+               .set('system:time_start', ee.Date.fromYMD(y, m, 1).millis());
+    });
+  }).flatten()
+);
+
+print("Monthly composites count:", s2monthly.size());
+
+//SAVI W/ TMASK COMPUTER
+var L = 0.428;
+
+var saviMonthly = s2monthly.map(function(img){
+
+  var savi = img.expression(
+    '((NIR - RED) / (NIR + RED + L)) * (1 + L)',
+    {
+      'NIR': img.select('B8'),
+      'RED': img.select('B4'),
+      'L': L
+    }
+  ).rename('SAVI').float();
+
+
+  var tmask = img.select(['B3','B11']);
+
+
+  return savi.addBands(tmask)
+             .copyProperties(img, ['system:time_start']);
+});
+
+print("SAVI series size:", saviMonthly.size());
+
+//CCDC RUNNER
+var ccdc = ee.Algorithms.TemporalSegmentation.Ccdc({
+  collection: saviMonthly,
+  breakpointBands: ['SAVI', 'B3', 'B11'],   // MUST include tmaskBands
+  tmaskBands: ['B3', 'B11'],                // MUST be exactly 2 bands
+  minObservations: 6,
+  chiSquareProbability: 0.99,
+  minNumOfYearsScaler: 1.0,
+  dateFormat: 1,
+  lambda: 0.0005,
+  maxIterations: 10000
+});
+
+
+//BREAK AND MAGNITUDE EXTRACTION
+
+var breakYear = ccdc.select('tBreak')
+  .arrayGet([0])
+  .rename('breakYear')
+  .float();
+
+
+var breakMag = ccdc.select('SAVI_magnitude')
+  .arrayGet([0])
+  .rename('breakMagnitude')
+  .float();
+
+
+var breakYearForHist = breakYear.where(breakYear.lte(0), 0).unmask(0);
+var breakMagForHist  = breakMag.where(breakYear.lte(0), 0).unmask(0);
+
+
+
+Map.addLayer(
+  breakYearForHist,
+  {min:2018, max:2025, palette:['yellow','orange','red']},
+  'Break Year (SAVI)',
+  false
+);
+
+Map.addLayer(
+  breakMagForHist,
+  {min:-0.2, max:0.2, palette:['blue','white','red']},
+  'Break Magnitude (SAVI)',
+  false
+);
+
+
+
+//HISTOGRAM BUILDER
+var SAMPLE_SIZE = 5000;
+var SCALE = 20;
+
+//BREAK YEAR
+var dumpYearSamp = breakYearForHist.sample({
+  region: dump,
+  scale: SCALE,
+  numPixels: SAMPLE_SIZE,
+  seed: 1,
+  dropNulls: true
+}).map(function(f){ return f.set('zone', 'OSS Dump'); });
+
+var ctrlYearSamp = breakYearForHist.sample({
+  region: control,
+  scale: SCALE,
+  numPixels: SAMPLE_SIZE,
+  seed: 2,
+  dropNulls: true
+}).map(function(f){ return f.set('zone', 'Split Creek'); });
+
+var allYear = dumpYearSamp.merge(ctrlYearSamp);
+
+//BREAK MAGNITUDE
+var dumpMagSamp = breakMagForHist.sample({
+  region: dump,
+  scale: SCALE,
+  numPixels: SAMPLE_SIZE,
+  seed: 3,
+  dropNulls: true
+}).map(function(f){ return f.set('zone', 'OSS Dump'); });
+
+var ctrlMagSamp = breakMagForHist.sample({
+  region: control,
+  scale: SCALE,
+  numPixels: SAMPLE_SIZE,
+  seed: 4,
+  dropNulls: true
+}).map(function(f){ return f.set('zone', 'Split Creek'); });
+
+var allMag = dumpMagSamp.merge(ctrlMagSamp);
+
+//HISTOGRAM RUNNER
+var histBreakYearDump = ui.Chart.feature.histogram(
+  dumpYearSamp,
+  'breakYear',
+  20
+)
+.setChartType('BarChart')        
+.setOptions({
+  title: 'Break Year — OSS Dump',
+  hAxis: {title: 'Sample Count'},   
+  vAxis: {title: 'Break Year'},
+  legend: {position: 'none'}
+});
+print(histBreakYearDump);
+
+var histBreakYearCtrl = ui.Chart.feature.histogram(
+  ctrlYearSamp,
+  'breakYear',
+  20
+)
+.setChartType('BarChart')
+.setOptions({
+  title: 'Break Year — Split Creek',
+  hAxis: {title: 'Sample Count'},
+  vAxis: {title: 'Break Year'},
+  legend: {position: 'none'}
+});
+print(histBreakYearCtrl);
+
+var histBreakMagDump = ui.Chart.feature.histogram(
+  dumpMagSamp,
+  'breakMagnitude',
+  20
+)
+.setChartType('BarChart')
+.setOptions({
+  title: 'Break Magnitude — OSS Dump',
+  hAxis: {title: 'Sample Count'},
+  vAxis: {title: 'Break Magnitude (ΔSAVI)'},
+  legend: {position: 'none'}
+});
+print(histBreakMagDump);
+
+var histBreakMagCtrl = ui.Chart.feature.histogram(
+  ctrlMagSamp,
+  'breakMagnitude',
+  20
+)
+.setChartType('BarChart')
+.setOptions({
+  title: 'Break Magnitude — Split Creek',
+  hAxis: {title: 'Sample Count'},
+  vAxis: {title: 'Break Magnitude (ΔSAVI)'},
+  legend: {position: 'none'}
+});
+print(histBreakMagCtrl);
+
+print("Dump breakYear min/max:", breakYear.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: dump,
+  scale: 20,
+  maxPixels: 1e13
+}));
+
+print("Control breakYear min/max:", breakYear.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: control,
+  scale: 20,
+  maxPixels: 1e13
+}));

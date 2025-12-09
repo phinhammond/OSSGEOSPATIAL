@@ -1,0 +1,684 @@
+//AOIS
+var oss = ee.FeatureCollection('projects/ossdump-475215/assets/ossdump');
+var natRe = ee.FeatureCollection('projects/ossdump-475215/assets/natreboundary');
+var pine = ee.FeatureCollection('projects/ossdump-475215/assets/pineplantation');
+var split = ee.FeatureCollection('projects/ossdump-475215/assets/splitcreek');
+
+//UNDIST FOREST CALC
+var forest = natRe.map(function(f) {
+  var diffGeom = f.geometry().difference(oss.geometry(), 1);
+  return ee.Feature(diffGeom).copyProperties(f);
+});
+
+//AOI LIST
+var AOI_LIST = [
+  {key: 'OSS_Dump', label: 'OSS Dump', fc: oss},
+  {key: 'Undisturbed_Forest', label: 'Undisturbed Forest', fc: forest},
+  {key: 'Pine_Plantation', label: 'Pine Plantation', fc: pine},
+  {key: 'Split_Creek', label: 'Split Creek', fc: split}
+];
+
+//AOI DICTIONARY
+var AOI_DICT = {};
+AOI_LIST.forEach(function(aoi) { AOI_DICT[aoi.key] = aoi.fc; });
+
+//AOI COLORS
+var AOI_COLORS = {
+  'OSS_Dump': 'firebrick',
+  'Undisturbed_Forest': 'darkgreen',
+  'Pine_Plantation': 'goldenrod',
+  'Split_Creek': 'steelblue'
+};
+
+
+function labelToKey(label){
+  for (var i=0;i<AOI_LIST.length;i++){
+    if (AOI_LIST[i].label === label) return AOI_LIST[i].key;
+  }
+  return null;
+}
+
+function keyToLabel(key){
+  for (var i=0;i<AOI_LIST.length;i++){
+    if (AOI_LIST[i].key === key) return AOI_LIST[i].label;
+  }
+  return key;
+}
+
+//SENTINEL 2 MIXER AND MASHER (COLLECTION AND MASKING)
+var S2raw = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(natRe)
+  .filterDate('2018-01-01', '2024-12-31');
+
+//SCL MASK
+function sclMask(image) {
+  var scl = image.select('SCL');
+  var clean = scl.neq(3)
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+  return image.updateMask(clean);
+}
+
+function scaleReflectance(image){
+  var scaled = image.select(['B2','B3','B4','B5','B8','B11','B12']).divide(10000);
+  return image.addBands(scaled, null, true);
+}
+
+function preprocess(image){
+  image = scaleReflectance(image);
+  image = sclMask(image);
+  return image.copyProperties(image, ['system:time_start']);
+}
+
+var S2 = S2raw.map(preprocess);
+
+//INDEX COMPUTER
+function computeAllIndices(image) {
+  var ndvi = image.normalizedDifference(['B8','B4']).rename('S2_NDVI');
+  var evi = image.expression(
+    '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))',
+    {NIR:image.select('B8'), RED:image.select('B4'), BLUE:image.select('B2')}
+  ).rename('S2_EVI');
+  var savi = image.expression(
+    '((NIR-RED)/(NIR+RED+0.5))*1.5',
+    {NIR:image.select('B8'), RED:image.select('B4')}
+  ).rename('S2_SAVI');
+  var nbr = image.normalizedDifference(['B8','B12']).rename('S2_NBR');
+  var gndvi = image.normalizedDifference(['B8','B3']).rename('S2_GNDVI');
+  var ccci = image.expression(
+    '((NIR / RE) - 1) / ((NIR / RED) - 1)',
+    {NIR:image.select('B8'), RE:image.select('B5'), RED:image.select('B4')}
+  ).rename('S2_CCCI');
+
+  return image.addBands([ndvi,evi,savi,nbr,gndvi,ccci])
+              .copyProperties(image, ['system:time_start']);
+}
+
+var S2all = S2.map(computeAllIndices);
+
+//INTERVAL MAKER
+function getIntervals(intervalType, startYear, endYear){
+  var intervals = [];
+  for (var y = startYear; y <= endYear; y++){
+    var startY = ee.Date.fromYMD(y,1,1);
+
+    if (intervalType === 'Biweekly'){
+      for (var w = 0; w < 52; w++){
+        intervals.push({
+          start: startY.advance(14*w,'day'),
+          end:   startY.advance(14*(w+1),'day')
+        });
+      }
+
+    } else if (intervalType === 'Seasonal'){
+      var seasons = [[1,3],[4,6],[7,9],[10,12]];
+      for (var s = 0; s < seasons.length; s++){
+        intervals.push({
+          start: ee.Date.fromYMD(y,seasons[s][0],1),
+          end:   ee.Date.fromYMD(y,seasons[s][1],1).advance(1,'month')
+        });
+      }
+
+    } else {
+      intervals.push({
+        start: ee.Date.fromYMD(y,1,1),
+        end:   ee.Date.fromYMD(y+1,1,1)
+      });
+    }
+  }
+  return ee.List(intervals);
+}
+
+//UI
+var bandOptions = [
+  'B2','B3','B4',
+  'S2_NDVI','S2_EVI','S2_SAVI','S2_NBR','S2_GNDVI','S2_CCCI'
+];
+
+var bandSelect = ui.Select({items: bandOptions, value:'S2_NDVI', style:{width:'220px'}});
+var intervalSelect = ui.Select({items:['Biweekly','Seasonal','Yearly'], value:'Biweekly', style:{width:'220px'}});
+var graphTypeSelect = ui.Select({items:['Median','Delta (Previous Interval)','Delta (Between AOIs)'], value:'Median', style:{width:'220px'}});
+
+
+var deltaItems = AOI_LIST.filter(function(a){ return a.key !== 'OSS_Dump'; }).map(function(a){ return a.label; });
+var deltaCompareSelect = ui.Select({items: deltaItems, value: deltaItems[0], style:{width:'220px'}});
+
+
+var aoiCheckboxes = {};
+var aoiPanel = ui.Panel({layout: ui.Panel.Layout.flow('vertical')});
+AOI_LIST.forEach(function(aoi){
+  var box = ui.Checkbox(aoi.label, true);
+  aoiCheckboxes[aoi.key] = box;
+  aoiPanel.add(box);
+});
+
+var runButton = ui.Button('Run', runChartsEE);
+var exportButton = ui.Button('Export CSV', exportCSV);
+var harmonicButton = ui.Button('Harmonic (OSS vs AOI)', runHarmonics);
+var exportHarmonicNoGraphButton = ui.Button('Export Harmonic CSV (No Graph)', exportHarmonicCSV_NoGraph);
+var exportHarmonicCSVButton = ui.Button('Export Harmonic CSV (Graph)', exportHarmonicCSV);
+var divergenceSelect = ui.Select({
+  items: ['Raw Magnitude (AOI - OSS)', 'Absolute Divergence |AOI - OSS|'],
+  value: 'Raw Magnitude (AOI - OSS)',
+  style: {width:'260px'}
+});
+
+//UI FRAMEWORK
+ui.root.widgets().reset([
+  ui.Panel({
+    widgets: [
+      ui.Label('1) Choose band/index:', {fontWeight:'bold'}), 
+      bandSelect,
+
+      ui.Label('2) Choose interval type:', {fontWeight:'bold'}), 
+      intervalSelect,
+
+      ui.Label('3) Choose AOIs:', {fontWeight:'bold'}), 
+      aoiPanel,
+
+      ui.Label('4) Graph type:', {fontWeight:'bold'}), 
+      graphTypeSelect,
+
+      ui.Label('For Delta (Between AOIs) & Harmonic:', {fontWeight:'bold'}), 
+      deltaCompareSelect,
+
+      runButton, 
+      exportButton,
+
+      ui.Label('Harmonic regression (1 seasonal cycle):', {fontWeight:'bold'}),
+      harmonicButton,
+      exportHarmonicCSVButton,
+      exportHarmonicNoGraphButton,
+
+      ui.Label('Harmonic Divergence Type:', {fontWeight:'bold'}),
+      divergenceSelect
+    ],
+    style:{width:'340px'}
+  })
+]);
+
+//AOI SELECTER
+function getSelectedAOIKeys(){
+  var keys = Object.keys(aoiCheckboxes).filter(function(k){ return aoiCheckboxes[k].getValue(); });
+
+ 
+  if (keys.indexOf('OSS_Dump') === -1)
+    keys.unshift('OSS_Dump');
+  else
+    keys = ['OSS_Dump'].concat(keys.filter(function(k){ return k !== 'OSS_Dump'; }));
+
+  return keys;
+}
+
+//MEDIAN COMPUTER
+function computeMedians(selectedBand, intervalType, selectedKeys) {
+
+  var intervals = getIntervals(intervalType, 2018, 2024);
+
+  return ee.FeatureCollection(intervals.map(function(interval){
+    interval = ee.Dictionary(interval);
+
+    var start = ee.Date(interval.get('start'));
+    var end   = ee.Date(interval.get('end'));
+
+    var med = S2all.filterDate(start, end).median();
+
+    var props = {
+      intervalStart: start.format('YYYY-MM-dd'),
+      intervalEnd:   end.format('YYYY-MM-dd')
+    };
+
+    selectedKeys.forEach(function(k){
+      var geom = AOI_DICT[k].geometry();
+
+      var val = med.reduceRegion({
+        reducer: ee.Reducer.median(),
+        geometry: geom,
+        scale: 10,
+        maxPixels: 1e10
+      });
+
+      var px = med.reduceRegion({
+        reducer: ee.Reducer.count(),
+        geometry: geom,
+        scale: 10,
+        maxPixels: 1e10
+      });
+
+      var rawVal = val.get(selectedBand);
+      props[k] = ee.Algorithms.If(val.contains(selectedBand), ee.Number(rawVal), null);
+
+      props['px_'+k] = px.get(selectedBand);
+    });
+
+    return ee.Feature(null, props);
+  }));
+}
+
+//CHART RUNNER
+function runChartsEE(){
+
+  var selectedBand = bandSelect.getValue();
+  var intervalType = intervalSelect.getValue();
+  var graphType    = graphTypeSelect.getValue();
+  var selectedKeys = getSelectedAOIKeys();
+  var compareLabel = deltaCompareSelect.getValue();
+
+  var fc = computeMedians(selectedBand, intervalType, selectedKeys);
+
+ //DELTA PREVIOUS
+  if (graphType === 'Delta (Previous Interval)') {
+
+    var list = fc.toList(fc.size());
+
+    var deltaList = ee.List.sequence(1, fc.size().subtract(1)).map(function(i){
+      i = ee.Number(i);
+      var prev = ee.Feature(list.get(i.subtract(1)));
+      var curr = ee.Feature(list.get(i));
+
+      var f = { intervalStart: curr.get('intervalStart') };
+
+      selectedKeys.forEach(function(k){
+        var pv = prev.get(k);
+        var cv = curr.get(k);
+        f[k] = (pv !== null && cv !== null) ? ee.Number(cv).subtract(pv) : null;
+      });
+
+      return ee.Feature(null, f);
+    });
+
+    fc = ee.FeatureCollection(deltaList);
+  }
+
+  //DELTA BETWEEN AOIS
+  if (graphType === 'Delta (Between AOIs)') {
+
+    var compareKey = labelToKey(compareLabel);
+
+    fc = fc.map(function(f){
+      var ossVal = f.get('OSS_Dump');
+      var cmpVal = f.get(compareKey);
+      var d = (ossVal !== null && cmpVal !== null) ? ee.Number(ossVal).subtract(cmpVal) : null;
+      return f.set('Delta', d);
+    });
+
+    var deltaColor = AOI_COLORS[compareKey] || 'black';
+
+    var chart = ui.Chart.feature.byFeature(fc, 'intervalStart', ['Delta'])
+      .setOptions({
+        title: 'Delta (OSS - '+compareLabel+') — '+selectedBand,
+        series: {0:{color: deltaColor}},
+        lineWidth: 2,
+        pointSize: 0,
+        interpolateNulls: true
+      });
+
+    print(chart);
+    return;
+  }
+
+  //MEDIAN
+  var seriesObj = {};
+  selectedKeys.forEach(function(k,i){ seriesObj[i] = {color: AOI_COLORS[k]}; });
+
+  var chart = ui.Chart.feature.byFeature(fc, 'intervalStart', selectedKeys)
+    .setOptions({
+      title: 'Median '+selectedBand+' per AOI',
+      series: seriesObj,
+      lineWidth:2,
+      pointSize:0,
+      interpolateNulls:true
+    });
+
+  print(chart);
+}
+
+//CSV EXCRETER
+function exportCSV(){
+
+  var selectedBand = bandSelect.getValue();
+  var intervalType = intervalSelect.getValue();
+  var graphType    = graphTypeSelect.getValue();
+  var selectedKeys = getSelectedAOIKeys();
+  var compareLabel = deltaCompareSelect.getValue();
+
+  var fc = computeMedians(selectedBand, intervalType, selectedKeys);
+
+  if (graphType==='Delta (Previous Interval)'){
+
+    var list = fc.toList(fc.size());
+
+    var deltaList = ee.List.sequence(1, fc.size().subtract(1)).map(function(i){
+      i = ee.Number(i);
+      var prev = ee.Feature(list.get(i.subtract(1)));
+      var curr = ee.Feature(list.get(i));
+
+      var f = { intervalStart: curr.get('intervalStart') };
+
+      selectedKeys.forEach(function(k){
+        var pv = prev.get(k);
+        var cv = curr.get(k);
+        f[k] = (pv !== null && cv !== null) ? ee.Number(cv).subtract(pv) : null;
+        f['px_'+k] = curr.get('px_'+k);
+      });
+
+      return ee.Feature(null, f);
+    });
+
+    fc = ee.FeatureCollection(deltaList);
+  }
+
+  if (graphType==='Delta (Between AOIs)') {
+
+    var compareKey = labelToKey(compareLabel);
+
+    fc = fc.map(function(f){
+      var ossVal = f.get('OSS_Dump');
+      var cmpVal = f.get(compareKey);
+      var d = (ossVal !== null && cmpVal !== null)
+        ? ee.Number(ossVal).subtract(cmpVal)
+        : null;
+      return f.set('Delta', d);
+    });
+  }
+
+  var typeLabel = (
+    graphType==='Median' ? 'Median' :
+    graphType==='Delta (Previous Interval)' ? 'DeltaPrev' :
+    'DeltaAOI'
+  );
+
+  var exportName = intervalType + '_' + typeLabel + '_' + selectedBand;
+
+  Export.table.toDrive({
+    collection: fc,
+    description: exportName,
+    folder: 'summarycsvs',
+    fileFormat: 'CSV'
+  });
+
+  print('Export started: '+exportName);
+}
+
+//HARMONIC REGRESSION
+var HARM_START = ee.Date('2018-01-01');
+var HARM_END   = ee.Date('2024-12-31');
+
+
+//TIME SERIES COMPUTER
+function buildHarmonicTS(aoiKey, band) {
+
+  var aoi = AOI_DICT[aoiKey];
+
+  var col = S2all
+    .select([band])
+    .filterBounds(aoi)
+    .filterDate(HARM_START, HARM_END);
+
+  var fc = ee.FeatureCollection(col.map(function(img){
+
+    var mean = img.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: aoi.geometry(),
+      scale: 10,
+      maxPixels: 1e10
+    }).get(band);
+
+    var isNull = ee.Algorithms.IsEqual(mean, null);
+
+    var years = img.date().difference(HARM_START, 'year');
+    var omega = years.multiply(2 * Math.PI);
+
+    return ee.Feature(null, {
+      time: img.date().format('YYYY-MM-dd'),
+      constant: 1,
+      t: years,
+      cos: omega.cos(),
+      sin: omega.sin(),
+      value: mean,
+      nullflag: isNull
+    });
+  }))
+  .filter(ee.Filter.eq('nullflag', false))
+  .select(['time','constant','t','cos','sin','value']);
+
+  return fc;
+}
+
+//HARMONIC FITTER
+function fitHarmonicCoeffs(fc) {
+  var result = fc.reduceColumns({
+    reducer: ee.Reducer.linearRegression({numX:4, numY:1}),
+    selectors: ['constant','t','cos','sin','value']
+  });
+
+  return ee.Array(result.get('coefficients'));
+}
+
+//HARMONIC REBUILDER
+function reconstructHarmonicCurve(coeffs, label) {
+
+  var totalYears = HARM_END.difference(HARM_START, 'year');
+  var step = 0.05;
+  var times = ee.List.sequence(0, totalYears, step);
+
+  var fc = ee.FeatureCollection(times.map(function(dt){
+    dt = ee.Number(dt);
+    var date = HARM_START.advance(dt, 'year');
+
+    var t = dt;
+    var omega = t.multiply(2*Math.PI);
+    var X = ee.Array([[1, t, omega.cos(), omega.sin()]]);
+    var y = X.matrixMultiply(coeffs).get([0,0]);
+
+    return ee.Feature(null, {
+      time: date.format('YYYY-MM-dd'),
+      value: y,
+      AOI: label
+    });
+  }));
+
+  return fc;
+}
+
+//HARMONIC GRAPH + DIVERGENCE RUNNER
+function runHarmonics(){
+
+  var band = bandSelect.getValue();
+  var compareLabel = deltaCompareSelect.getValue();
+  var compareKey = labelToKey(compareLabel);
+
+  var tsOSS = buildHarmonicTS('OSS_Dump', band);
+  var coeffOSS = fitHarmonicCoeffs(tsOSS);
+  var curveOSS = reconstructHarmonicCurve(coeffOSS, 'OSS Dump');
+
+  var tsCmp = buildHarmonicTS(compareKey, band);
+  var coeffCmp = fitHarmonicCoeffs(tsCmp);
+  var curveCmp = reconstructHarmonicCurve(coeffCmp, compareLabel);
+
+  var joined = ee.Join.inner().apply({
+    primary: curveOSS,
+    secondary: curveCmp,
+    condition: ee.Filter.equals({
+      leftField: 'time',
+      rightField: 'time'
+    })
+  });
+
+  var diffLabel = 'Divergence (' + compareLabel + ' - OSS)';
+
+  var diffFC = ee.FeatureCollection(joined.map(function(p) {
+    var fOSS = ee.Feature(p.get('primary'));
+    var fAOI = ee.Feature(p.get('secondary'));
+
+    var vOSS = ee.Number(fOSS.get('value'));
+    var vAOI = ee.Number(fAOI.get('value'));
+
+    
+    var divergence = vAOI.subtract(vOSS);
+
+
+    divergence = ee.Algorithms.If(
+      divergenceSelect.getValue() === 'Absolute Divergence |AOI - OSS|',
+      ee.Number(divergence).abs(),
+      divergence
+    );
+
+    return ee.Feature(null, {
+      time: fOSS.get('time'),
+      value: divergence,
+      AOI: diffLabel
+    });
+  }));
+
+  var merged = curveOSS.merge(curveCmp).merge(diffFC);
+
+  var chart = ui.Chart.feature.groups(
+      merged,
+      'time',
+      'value',
+      'AOI'
+    )
+    .setChartType('LineChart')
+    .setOptions({
+      title: 'Harmonic Divergence — ' + band +
+             ' — OSS vs ' + compareLabel,
+      lineWidth: 2,
+      pointSize: 0,
+      colors: [
+        AOI_COLORS['OSS_Dump'],
+        AOI_COLORS[compareKey],
+        'black'
+      ],
+      hAxis: {title: 'Time'},
+      vAxis: {title: band + ' (magnitude)'}
+    });
+
+  print(chart);
+}
+
+//HARMONIC + DVERGENCE CSV EXCRETER
+function exportHarmonicCSV(){
+
+  var band = bandSelect.getValue();
+  var compareLabel = deltaCompareSelect.getValue();
+  var compareKey = labelToKey(compareLabel);
+
+  var tsOSS = buildHarmonicTS('OSS_Dump', band);
+  var coeffOSS = fitHarmonicCoeffs(tsOSS);
+  var curveOSS = reconstructHarmonicCurve(coeffOSS, 'OSS Dump');
+
+  var tsCmp = buildHarmonicTS(compareKey, band);
+  var coeffCmp = fitHarmonicCoeffs(tsCmp);
+  var curveCmp = reconstructHarmonicCurve(coeffCmp, compareLabel);
+
+  var joined = ee.Join.inner().apply({
+    primary: curveOSS,
+    secondary: curveCmp,
+    condition: ee.Filter.equals({
+      leftField: 'time',
+      rightField: 'time'
+    })
+  });
+
+  var diffFC = ee.FeatureCollection(joined.map(function(p) {
+    var fOSS = ee.Feature(p.get('primary'));
+    var fAOI = ee.Feature(p.get('secondary'));
+
+    var vOSS = ee.Number(fOSS.get('value'));
+    var vAOI = ee.Number(fAOI.get('value'));
+
+    var divergence = vAOI.subtract(vOSS);
+
+    divergence = ee.Algorithms.If(
+      divergenceSelect.getValue() === 'Absolute Divergence |AOI - OSS|',
+      ee.Number(divergence).abs(),
+      divergence
+    );
+
+    return ee.Feature(null, {
+      time: fOSS.get('time'),
+      OSS: vOSS,
+      AOI: vAOI,
+      Divergence: divergence
+    });
+  }));
+
+  var exportName = 'Harmonic_' + band + '_Divergence_' + compareLabel;
+
+  Export.table.toDrive({
+    collection: diffFC,
+    description: exportName,
+    folder: 'harmonic_exports',
+    fileFormat: 'CSV'
+  });
+
+  print('Export started: ' + exportName);
+}
+
+//NO GRAPH HARMONIC CSV EXCRETER
+function exportHarmonicCSV_NoGraph() {
+
+  var band = bandSelect.getValue();
+  var compareLabel = deltaCompareSelect.getValue();
+  var compareKey = labelToKey(compareLabel);
+
+  
+  var tsOSS = buildHarmonicTS('OSS_Dump', band);
+  var coeffOSS = fitHarmonicCoeffs(tsOSS);
+  var curveOSS = reconstructHarmonicCurve(coeffOSS, 'OSS Dump');
+
+  var tsCmp = buildHarmonicTS(compareKey, band);
+  var coeffCmp = fitHarmonicCoeffs(tsCmp);
+  var curveCmp = reconstructHarmonicCurve(coeffCmp, compareLabel);
+
+
+  var joined = ee.Join.inner().apply({
+    primary: curveOSS,
+    secondary: curveCmp,
+    condition: ee.Filter.equals({
+      leftField: 'time',
+      rightField: 'time'
+    })
+  });
+
+  var diffFC = ee.FeatureCollection(joined.map(function(p) {
+    var fOSS = ee.Feature(p.get('primary'));
+    var fAOI = ee.Feature(p.get('secondary'));
+
+    var vOSS = ee.Number(fOSS.get('value'));
+    var vAOI = ee.Number(fAOI.get('value'));
+
+   
+    var divergence = vAOI.subtract(vOSS);
+
+    divergence = ee.Algorithms.If(
+      divergenceSelect.getValue() === 'Absolute Divergence |AOI - OSS|',
+      ee.Number(divergence).abs(),
+      divergence
+    );
+
+    return ee.Feature(null, {
+      time: fOSS.get('time'),
+      OSS: vOSS,
+      AOI: vAOI,
+      Divergence: divergence
+    });
+  }));
+
+  var exportName = 'Harmonic_' + band + '_Divergence_OnlyCSV_' + compareLabel;
+
+  Export.table.toDrive({
+    collection: diffFC,
+    description: exportName,
+    folder: 'harmonic_exports',
+    fileFormat: 'CSV'
+  });
+
+  print('Exporting CSV (No Graph)...   Name: ' + exportName);
+}
+
+
+

@@ -1,0 +1,174 @@
+//WINTER SUMMER KDE EXPORTER
+
+//AOIS
+var oss = ee.FeatureCollection('projects/ossdump-475215/assets/ossdump');
+var natRe = ee.FeatureCollection('projects/ossdump-475215/assets/natreboundary');
+var pine = ee.FeatureCollection('projects/ossdump-475215/assets/pineplantation');
+var split = ee.FeatureCollection('projects/ossdump-475215/assets/splitcreek');
+
+//UNDIST FOREST CALCULATOR
+var forest = natRe.map(function(f) {
+  return ee.Feature(f.geometry().difference(oss.geometry(), 1)).copyProperties(f);
+});
+
+//AOI LIST
+var AOI_LIST = [
+  {key:'OSS_Dump', label:'OSS Dump', fc:oss},
+  {key:'Undisturbed_Forest', label:'Undisturbed Forest', fc:forest},
+  {key:'Pine_Plantation', label:'Pine Plantation', fc:pine},
+  {key:'Split_Creek', label:'Split Creek', fc:split}
+];
+
+var AOI_DICT = {};
+AOI_LIST.forEach(function(a){ AOI_DICT[a.key] = a.fc; });
+
+//SENTINEL 2 PROCCESING
+var S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(natRe)
+  .filterDate('2018-01-01', '2024-12-31');
+
+function sclMask(img){
+  var scl = img.select('SCL');
+  return img.updateMask(
+    scl.neq(3).and(scl.neq(8)).and(scl.neq(9))
+        .and(scl.neq(10)).and(scl.neq(11))
+  );
+}
+
+function scale(img){
+  return img.addBands(
+    img.select(['B2','B3','B4','B5','B8','B11','B12']).divide(10000),
+    null,true);
+}
+
+//VEG INDICES
+function computeIndices(img){
+  var ndvi = img.normalizedDifference(['B8','B4']).rename('S2_NDVI');
+
+  var evi = img.expression(
+    '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))',
+    {NIR:img.select('B8'), RED:img.select('B4'), BLUE:img.select('B2')}
+  ).rename('S2_EVI');
+
+  var savi = img.expression(
+    '((NIR-RED)/(NIR+RED+0.5))*1.5',
+    {NIR:img.select('B8'), RED:img.select('B4')}
+  ).rename('S2_SAVI');
+
+  var nbr = img.normalizedDifference(['B8','B12']).rename('S2_NBR');
+  var gndvi = img.normalizedDifference(['B8','B3']).rename('S2_GNDVI');
+
+  var ccci = img.expression(
+    '((NIR / RE) - 1) / ((NIR / RED) - 1)',
+    {NIR:img.select('B8'), RE:img.select('B5'), RED:img.select('B4')}
+  ).rename('S2_CCCI');
+
+  return img.addBands([ndvi,evi,savi,nbr,gndvi,ccci])
+            .copyProperties(img,['system:time_start']);
+}
+
+var S2all = S2.map(scale).map(sclMask).map(computeIndices);
+
+//TIME METADATA
+S2all = S2all.map(function(img){
+  var d = ee.Date(img.get('system:time_start'));
+  return img.set({month:d.get('month'), year:d.get('year')});
+});
+
+//INTERVALS
+function getBiweekly(start,end){
+  var ints = [];
+  for (var y=start; y<=end; y++){
+    var sy = ee.Date.fromYMD(y,1,1);
+    for (var w=0; w<26; w++){
+      ints.push({start: sy.advance(14*w,'day'), end: sy.advance(14*(w+1),'day')});
+    }
+  }
+  return ee.List(ints);
+}
+var intervals = getBiweekly(2018,2024);
+
+//VAR EXPORT
+var exportBands = [
+  "B2","B3","B4",
+  "S2_NDVI","S2_EVI","S2_SAVI","S2_NBR","S2_GNDVI","S2_CCCI"
+];
+
+//EXCRETER
+function extractBySeason(aoiKey, seasonMonths, seasonLabel){
+  var geom = AOI_DICT[aoiKey].geometry();
+
+  var feats = intervals.map(function(intv){
+    intv = ee.Dictionary(intv);
+    var start = ee.Date(intv.get("start"));
+    var end   = ee.Date(intv.get("end"));
+
+    var col = S2all.filterDate(start,end)
+                   .filter(ee.Filter.inList('month', seasonMonths))
+                   .select(exportBands);
+
+    var count = col.size();
+    var medImg = ee.Image(ee.Algorithms.If(count.gt(0), col.median(), null));
+
+    var stats = ee.Algorithms.If(
+      count.gt(0),
+      medImg.reduceRegion({
+        reducer: ee.Reducer.median(),
+        geometry: geom,
+        scale: 10,
+        maxPixels: 1e10
+      }),
+      null
+    );
+
+    return ee.Feature(null, {
+      interval_start: start.format('YYYY-MM-dd'),
+      interval_end: end.format('YYYY-MM-dd'),
+      AOI: aoiKey,
+      SEASON: seasonLabel
+    }).set(stats);
+  });
+
+  return ee.FeatureCollection(feats).filter(ee.Filter.notNull(exportBands));
+}
+
+//UI
+var compareSelect = ui.Select({
+  items: AOI_LIST.map(function(a){ return a.key; }),
+  value: "Split_Creek",
+  style:{width:'200px'}
+});
+
+var exportBtn = ui.Button("Export CSV — Winter+Summer — 3 Bands + Indices", exportData);
+
+ui.root.widgets().reset([
+  ui.Panel([
+    ui.Label("Compare OSS_Dump against:"),
+    compareSelect,
+    exportBtn
+  ])
+]);
+
+//CSV EXCRETER 
+function exportData(){
+
+  var cmpKey = compareSelect.getValue();
+
+  var winterOSS = extractBySeason('OSS_Dump',[11,12,1,2,3],'Winter');
+  var winterCmp = extractBySeason(cmpKey,[11,12,1,2,3],'Winter');
+
+  var summerOSS = extractBySeason('OSS_Dump',[6,7,8],'Summer');
+  var summerCmp = extractBySeason(cmpKey,[6,7,8],'Summer');
+
+  var merged = winterOSS.merge(winterCmp).merge(summerOSS).merge(summerCmp);
+
+  var exportName = 'OSS_vs_'+cmpKey+'_WinterSummer_3Bands_6Indices';
+
+  Export.table.toDrive({
+    collection: merged,
+    description: exportName,
+    fileFormat: 'CSV'
+  });
+
+  print("Export Started:", exportName);
+}
